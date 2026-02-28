@@ -13,6 +13,9 @@ addToLibrary({
 #if expectToReceiveOnModule('websocket')
     websocketArgs: {},
 #endif
+#if expectToReceiveOnModule('socket')
+    socketArgs: {},
+#endif
     callbacks: {},
     on(event, callback) {
       SOCKFS.callbacks[event] = callback;
@@ -21,6 +24,13 @@ addToLibrary({
       SOCKFS.callbacks[event]?.(param);
     },
     mount(mount) {
+#if expectToReceiveOnModule('socket')
+      // The incoming Module['socket'] can be used to configure transport and
+      // transport-specific options.
+      SOCKFS.socketArgs = {{{ makeModuleReceiveExpr('socket', '{}') }}};
+      // Mirror the event registration API on Module['socket'].
+      (Module['socket'] ??= {})['on'] = SOCKFS.on;
+#endif
 #if expectToReceiveOnModule('websocket')
       // The incoming Module['websocket'] can be used for configuring 
       // subprotocol/url, etc
@@ -42,6 +52,56 @@ addToLibrary({
 #endif
 
       return FS.createNode(null, '/', {{{ cDefs.S_IFDIR | 0o777 }}}, 0);
+    },
+    getSocketTransport() {
+      var transport = '{{{ SOCKET_TRANSPORT }}}';
+#if expectToReceiveOnModule('socket')
+      if (SOCKFS.socketArgs['transport']) {
+        transport = SOCKFS.socketArgs['transport'];
+      }
+#endif
+      transport = String(transport).toLowerCase();
+      if (transport != 'webtransport' && transport != 'auto') {
+        return 'websocket';
+      }
+      return transport;
+    },
+    getWebTransportURL(addr, port) {
+      // The replace is needed because the compiler replaces '//' comments with
+      // '#', so we'd end up with https:#.
+      var url = '{{{ WEBTRANSPORT_URL }}}'.replace('#', '//');
+#if expectToReceiveOnModule('socket')
+      var webtransportConfig = SOCKFS.socketArgs['webtransport'];
+      if (webtransportConfig?.['url']) {
+        url = webtransportConfig['url'];
+      }
+#endif
+
+      if (url === 'https://') {
+        var parts = addr.split('/');
+        url = url + parts[0] + ':' + port + '/' + parts.slice(1).join('/');
+      }
+      return url;
+    },
+    shouldUseWebTransport(sock) {
+      return sock.type === {{{ cDefs.SOCK_DGRAM }}} &&
+             (sock.transport === 'webtransport' || sock.transport === 'auto');
+    },
+    sliceSendData(buffer, offset, length) {
+      // Create a detached copy before sending to avoid exposing unrelated bytes
+      // from the underlying buffer.
+      if (ArrayBuffer.isView(buffer)) {
+        offset += buffer.byteOffset;
+        buffer = buffer.buffer;
+      }
+      var data = buffer.slice(offset, offset + length);
+#if PTHREADS
+      // WebSockets / WebTransport don't accept SharedArrayBuffer payloads.
+      if (data instanceof SharedArrayBuffer) {
+        data = new Uint8Array(new Uint8Array(data)).buffer;
+      }
+#endif
+      return data;
     },
     createSocket(family, type, protocol) {
       // Emscripten only supports AF_INET
@@ -65,6 +125,7 @@ addToLibrary({
         protocol,
         server: null,
         error: null, // Used in getsockopt for SOL_SOCKET/SO_ERROR test
+        transport: type == {{{ cDefs.SOCK_DGRAM }}} ? SOCKFS.getSocketTransport() : 'websocket',
         peers: {},
         pending: [],
         recv_queue: [],
@@ -450,7 +511,13 @@ addToLibrary({
         // close any peer connections
         for (var peer of Object.values(sock.peers)) {
           try {
-            peer.socket.close();
+            if (peer.socket) {
+              peer.socket.close();
+            } else if (peer.transport) {
+              peer.reader?.cancel();
+              peer.writer?.releaseLock();
+              peer.transport.close();
+            }
           } catch (e) {
           }
           SOCKFS.websocket_sock_ops.removePeer(sock, peer);
@@ -485,6 +552,11 @@ addToLibrary({
       connect(sock, addr, port) {
         if (sock.server) {
           throw new FS.ErrnoError({{{ cDefs.EOPNOTSUPP }}});
+        }
+
+        if (SOCKFS.shouldUseWebTransport(sock)) {
+          SOCKFS.webtransport_sock_ops.connect(sock, addr, port);
+          return;
         }
 
         // TODO autobind
@@ -616,6 +688,10 @@ addToLibrary({
           port = sock.dport;
         }
 
+        if (SOCKFS.shouldUseWebTransport(sock)) {
+          return SOCKFS.webtransport_sock_ops.sendmsg(sock, buffer, offset, length, addr, port);
+        }
+
         // find the peer for the destination address
         var dest = SOCKFS.websocket_sock_ops.getPeer(sock, addr, port);
 
@@ -630,23 +706,7 @@ addToLibrary({
           }
         }
 
-        // create a copy of the incoming data to send, as the WebSocket API
-        // doesn't work entirely with an ArrayBufferView, it'll just send
-        // the entire underlying buffer
-        if (ArrayBuffer.isView(buffer)) {
-          offset += buffer.byteOffset;
-          buffer = buffer.buffer;
-        }
-
-        var data = buffer.slice(offset, offset + length);
-#if PTHREADS
-        // WebSockets .send() does not allow passing a SharedArrayBuffer, so
-        // clone the SharedArrayBuffer as regular ArrayBuffer before
-        // sending.
-        if (data instanceof SharedArrayBuffer) {
-          data = new Uint8Array(new Uint8Array(data)).buffer;
-        }
-#endif
+        var data = SOCKFS.sliceSendData(buffer, offset, length);
 
         // if we don't have a cached connectionless UDP datagram connection, or
         // the TCP socket is still connecting, queue the message to be sent upon
@@ -729,6 +789,219 @@ addToLibrary({
         }
 
         return res;
+      }
+    },
+    webtransport_sock_ops: {
+      getPeer(sock, addr, port) {
+        return sock.peers[addr + ':' + port];
+      },
+      addPeer(sock, peer) {
+        sock.peers[peer.addr + ':' + peer.port] = peer;
+      },
+      removePeer(sock, peer) {
+        delete sock.peers[peer.addr + ':' + peer.port];
+      },
+      emitError(sock, message) {
+        sock.error = {{{ cDefs.ECONNREFUSED }}};
+        SOCKFS.emit('error', [sock.stream.fd, sock.error, message]);
+      },
+      closePeer(sock, peer) {
+        if (peer.closed) {
+          return;
+        }
+        peer.closed = true;
+        SOCKFS.webtransport_sock_ops.removePeer(sock, peer);
+        try {
+          peer.reader?.cancel();
+        } catch (e) {
+        }
+        try {
+          peer.writer?.releaseLock();
+        } catch (e) {
+        }
+        try {
+          peer.transport?.close();
+        } catch (e) {
+        }
+      },
+      fallbackToWebSocket(sock, addr, port, reason) {
+#if SOCKET_DEBUG
+        dbg(`webtransport: fallback to websocket (${reason})`);
+#endif
+        sock.error = {{{ cDefs.EPROTONOSUPPORT }}};
+        sock.transport = 'websocket';
+        return SOCKFS.websocket_sock_ops.createPeer(sock, addr, port);
+      },
+      fallbackPeerToWebSocket(sock, peer, reason) {
+        var queued = peer.msg_send_queue.slice();
+        var addr = peer.addr;
+        var port = peer.port;
+        SOCKFS.webtransport_sock_ops.closePeer(sock, peer);
+        var fallbackPeer = SOCKFS.webtransport_sock_ops.fallbackToWebSocket(sock, addr, port, reason);
+        for (var data of queued) {
+          fallbackPeer.msg_send_queue.push(data);
+        }
+        return fallbackPeer;
+      },
+      createPeer(sock, addr, port) {
+        var WebTransportConstructor = globalThis.WebTransport;
+        if (!WebTransportConstructor) {
+          return SOCKFS.webtransport_sock_ops.fallbackToWebSocket(sock, addr, port, 'WebTransport API unavailable');
+        }
+
+        var session;
+        var url = SOCKFS.getWebTransportURL(addr, port);
+#if SOCKET_DEBUG
+        dbg(`webtransport: connect: ${url}`);
+#endif
+        try {
+          session = new WebTransportConstructor(url);
+        } catch (e) {
+          return SOCKFS.webtransport_sock_ops.fallbackToWebSocket(sock, addr, port, `WebTransport constructor failed: ${e}`);
+        }
+
+        var peer = {
+          addr,
+          port,
+          transport: session,
+          msg_send_queue: [],
+          ready: false,
+          closed: false,
+          writer: null,
+          reader: null
+        };
+        SOCKFS.webtransport_sock_ops.addPeer(sock, peer);
+        SOCKFS.webtransport_sock_ops.handlePeerEvents(sock, peer);
+        return peer;
+      },
+      connect(sock, addr, port) {
+        if (sock.transport === 'websocket') {
+          SOCKFS.websocket_sock_ops.connect(sock, addr, port);
+          return;
+        }
+
+        if (typeof sock.daddr != 'undefined' && typeof sock.dport != 'undefined') {
+          var dest = SOCKFS.webtransport_sock_ops.getPeer(sock, sock.daddr, sock.dport);
+          if (dest) {
+            if (!dest.ready && !dest.closed) {
+              throw new FS.ErrnoError({{{ cDefs.EALREADY }}});
+            }
+            throw new FS.ErrnoError({{{ cDefs.EISCONN }}});
+          }
+        }
+
+        var peer = SOCKFS.webtransport_sock_ops.createPeer(sock, addr, port);
+        sock.daddr = peer.addr;
+        sock.dport = peer.port;
+        sock.connecting = true;
+      },
+      flushSendQueue(sock, peer) {
+        var queued = peer.msg_send_queue.shift();
+        while (queued) {
+#if SOCKET_DEBUG
+          dbg(`webtransport: sending queued data (${queued.byteLength} bytes): ${new Uint8Array(queued)}`);
+#endif
+          peer.writer.write(new Uint8Array(queued)).catch((e) => {
+            SOCKFS.webtransport_sock_ops.emitError(sock, `ECONNREFUSED: WebTransport send failed (${e})`);
+          });
+          queued = peer.msg_send_queue.shift();
+        }
+      },
+      readIncomingDatagrams(sock, peer) {
+        (async () => {
+          while (!peer.closed) {
+            var result = await peer.reader.read();
+            if (result.done || peer.closed) {
+              break;
+            }
+            var value = result.value;
+            if (!value || !value.byteLength) {
+              continue;
+            }
+            var data = value instanceof Uint8Array ? value : new Uint8Array(value);
+            sock.recv_queue.push({ addr: peer.addr, port: peer.port, data });
+            SOCKFS.emit('message', sock.stream.fd);
+          }
+        })().catch((e) => {
+          if (!peer.closed) {
+            SOCKFS.webtransport_sock_ops.emitError(sock, `ECONNREFUSED: WebTransport receive failed (${e})`);
+          }
+        });
+      },
+      handlePeerEvents(sock, peer) {
+        peer.transport.ready.then(() => {
+          if (peer.closed) {
+            return;
+          }
+          try {
+            peer.writer = peer.transport.datagrams.writable.getWriter();
+            peer.reader = peer.transport.datagrams.readable.getReader();
+          } catch (e) {
+            try {
+              SOCKFS.webtransport_sock_ops.fallbackPeerToWebSocket(sock, peer, `Datagram setup failed: ${e}`);
+            } catch (fallbackError) {
+              SOCKFS.webtransport_sock_ops.emitError(sock, `ECONNREFUSED: WebTransport fallback failed (${fallbackError})`);
+            }
+            return;
+          }
+          peer.ready = true;
+          sock.connecting = false;
+          SOCKFS.emit('open', sock.stream.fd);
+          SOCKFS.webtransport_sock_ops.flushSendQueue(sock, peer);
+          SOCKFS.webtransport_sock_ops.readIncomingDatagrams(sock, peer);
+        }).catch((e) => {
+          try {
+            SOCKFS.webtransport_sock_ops.fallbackPeerToWebSocket(sock, peer, `Session ready failed: ${e}`);
+          } catch (fallbackError) {
+            SOCKFS.webtransport_sock_ops.emitError(sock, `ECONNREFUSED: WebTransport fallback failed (${fallbackError})`);
+          }
+        });
+
+        peer.transport.closed.then(() => {
+          if (peer.closed) {
+            return;
+          }
+          SOCKFS.webtransport_sock_ops.closePeer(sock, peer);
+          SOCKFS.emit('close', sock.stream.fd);
+        }).catch((e) => {
+          if (peer.closed) {
+            return;
+          }
+          SOCKFS.webtransport_sock_ops.emitError(sock, `ECONNREFUSED: WebTransport closed with error (${e})`);
+          SOCKFS.webtransport_sock_ops.closePeer(sock, peer);
+          SOCKFS.emit('close', sock.stream.fd);
+        });
+      },
+      sendmsg(sock, buffer, offset, length, addr, port) {
+        if (sock.transport === 'websocket') {
+          return SOCKFS.websocket_sock_ops.sendmsg(sock, buffer, offset, length, addr, port);
+        }
+
+        var dest = SOCKFS.webtransport_sock_ops.getPeer(sock, addr, port);
+        if (!dest || dest.closed) {
+          dest = SOCKFS.webtransport_sock_ops.createPeer(sock, addr, port);
+        }
+
+        if (dest.socket) {
+          return SOCKFS.websocket_sock_ops.sendmsg(sock, buffer, offset, length, addr, port);
+        }
+
+        var data = SOCKFS.sliceSendData(buffer, offset, length);
+        if (!dest.ready || !dest.writer) {
+#if SOCKET_DEBUG
+          dbg(`webtransport: queuing (${length} bytes): ${new Uint8Array(data)}`);
+#endif
+          dest.msg_send_queue.push(data);
+          return length;
+        }
+
+#if SOCKET_DEBUG
+        dbg(`webtransport: send (${length} bytes): ${new Uint8Array(data)}`);
+#endif
+        dest.writer.write(new Uint8Array(data)).catch((e) => {
+          SOCKFS.webtransport_sock_ops.emitError(sock, `ECONNREFUSED: WebTransport send failed (${e})`);
+        });
+        return length;
       }
     }
   },

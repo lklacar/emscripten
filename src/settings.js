@@ -403,6 +403,18 @@ var FS_DEBUG = false;
 // [link]
 var SOCKET_WEBRTC = false;
 
+// Selects the socket transport implementation used by SOCKFS.
+// - 'websocket': Use the current WebSocket transport implementation.
+// - 'webtransport': Use WebTransport for UDP sockets. Stream sockets will
+//   continue to use the WebSocket backend.
+// - 'auto': Prefer WebTransport for UDP sockets and fall back to WebSocket if
+//   WebTransport is unavailable.
+//
+// This can also be configured at runtime using:
+//   Module['socket'] = { transport: 'webtransport' };
+// [link]
+var SOCKET_TRANSPORT = 'websocket';
+
 // A string containing either a WebSocket URL prefix (ws:// or wss://) or a
 // complete RFC 6455 URL - "ws[s]:" "//" host [ ":" port ] path [ "?" query ].
 // In the (default) case of only a prefix being specified the URL will be
@@ -410,6 +422,16 @@ var SOCKET_WEBRTC = false;
 // where addr and port are derived from the socket connect/bind/accept calls.
 // [link]
 var WEBSOCKET_URL = 'ws://';
+
+// A string containing either a WebTransport URL prefix ('https://') or a full
+// WebTransport endpoint URL.
+// In the (default) case of only a prefix being specified, the final URL will
+// be constructed from prefix + addr + ':' + port.
+//
+// This can also be configured at runtime using:
+//   Module['socket'] = { webtransport: { url: 'https://example.com:4433/' } };
+// [link]
+var WEBTRANSPORT_URL = 'https://';
 
 // If 1, the POSIX sockets API uses a native bridge process server to proxy
 // sockets calls from browser to native world.
@@ -975,7 +997,7 @@ var INCOMING_MODULE_JS_API = [
   'preInit', 'preMainLoop', 'preRun',
   'preinitializedWebGLContext', 'preloadPlugins',
   'print', 'printErr', 'setStatus', 'statusMessage', 'stderr',
-  'stdin', 'stdout', 'thisProgram', 'wasm', 'wasmBinary', 'websocket'
+  'stdin', 'stdout', 'thisProgram', 'wasm', 'wasmBinary', 'socket', 'websocket'
 ];
 
 // If set to nonzero, the provided virtual filesystem is treated

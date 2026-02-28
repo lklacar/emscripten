@@ -1173,12 +1173,12 @@ In addition to being able to register network callbacks from C it is also possib
 
 .. code-block:: javascript
 
-  Module['websocket']['on']('error', function(error) {console.log('Socket error ' + error);});
-  Module['websocket']['on']('open', function(fd) {console.log('Socket open fd = ' + fd);});
-  Module['websocket']['on']('listen', function(fd) {console.log('Socket listen fd = ' + fd);});
-  Module['websocket']['on']('connection', function(fd) {console.log('Socket connection fd = ' + fd);});
-  Module['websocket']['on']('message', function(fd) {console.log('Socket message fd = ' + fd);});
-  Module['websocket']['on']('close', function(fd) {console.log('Socket close fd = ' + fd);});
+  Module['socket']['on']('error', function(error) {console.log('Socket error ' + error);});
+  Module['socket']['on']('open', function(fd) {console.log('Socket open fd = ' + fd);});
+  Module['socket']['on']('listen', function(fd) {console.log('Socket listen fd = ' + fd);});
+  Module['socket']['on']('connection', function(fd) {console.log('Socket connection fd = ' + fd);});
+  Module['socket']['on']('message', function(fd) {console.log('Socket message fd = ' + fd);});
+  Module['socket']['on']('close', function(fd) {console.log('Socket close fd = ' + fd);});
 
 Most of the JavaScript callback functions above get passed the file descriptor of the socket that triggered the callback, the on error callback however gets passed an *array* that contains the file descriptor, the error code and an error message.
 

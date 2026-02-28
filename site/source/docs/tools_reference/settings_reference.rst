@@ -561,6 +561,23 @@ multiple different services.
 
 Default value: false
 
+.. _socket_transport:
+
+SOCKET_TRANSPORT
+================
+
+Selects the socket transport implementation used by SOCKFS.
+- 'websocket': Use the current WebSocket transport implementation.
+- 'webtransport': Use WebTransport for UDP sockets. Stream sockets will
+  continue to use the WebSocket backend.
+- 'auto': Prefer WebTransport for UDP sockets and fall back to WebSocket if
+  WebTransport is unavailable.
+
+This can also be configured at runtime using:
+  Module['socket'] = { transport: 'webtransport' };
+
+Default value: 'websocket'
+
 .. _websocket_url:
 
 WEBSOCKET_URL
@@ -573,6 +590,21 @@ constructed from prefix + addr + ':' + port
 where addr and port are derived from the socket connect/bind/accept calls.
 
 Default value: 'ws://'
+
+.. _webtransport_url:
+
+WEBTRANSPORT_URL
+================
+
+A string containing either a WebTransport URL prefix ('https://') or a full
+WebTransport endpoint URL.
+In the (default) case of only a prefix being specified, the final URL will
+be constructed from prefix + addr + ':' + port.
+
+This can also be configured at runtime using:
+  Module['socket'] = { webtransport: { url: 'https://example.com:4433/' } };
+
+Default value: 'https://'
 
 .. _proxy_posix_sockets:
 

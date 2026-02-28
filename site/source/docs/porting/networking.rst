@@ -52,6 +52,24 @@ to connect to, and the linker flag ``-sWEBSOCKET_SUBPROTOCOL`` or
 ``Module['websocket']['subprotocol']`` to control the connection type
 (``'binary'`` or ``'text'``).
 
+WebTransport (HTTP/3) for Emulated POSIX UDP
+============================================
+
+Emscripten can also use WebTransport as an alternative transport for emulated
+POSIX UDP sockets (``SOCK_DGRAM``).
+
+To enable this mode, build with ``-sSOCKET_TRANSPORT=webtransport``.
+By default, Emscripten uses WebSocket transport. Use
+``-sSOCKET_TRANSPORT=auto`` to prefer WebTransport for UDP sockets but fall
+back to WebSockets when WebTransport is unavailable.
+
+WebTransport endpoint selection can be configured with
+``-sWEBTRANSPORT_URL`` or at runtime via
+``Module['socket'] = { webtransport: { url: 'https://example.com:4433/' } };``.
+
+In this initial mode, stream sockets (``SOCK_STREAM``) continue to run over the
+WebSocket backend.
+
 Full POSIX Sockets over WebSocket Proxy Server
 ==============================================
 

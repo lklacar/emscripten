@@ -382,6 +382,30 @@ class sockets(BrowserCore):
       self.assertContained('do_msg_read: read 14 bytes', out)
       self.assertContained('connect: ws://localhost:59168/testA/testB, text,base64,binary', out)
 
+  @requires_dev_dependency('ws')
+  @parameterized({
+    'tcp': [59220, 0],
+    'udp': [59221, 1],
+  })
+  def test_nodejs_sockets_echo_webtransport_fallback(self, port, dgram):
+    args = ['-DTEST_DGRAM=%d' % dgram]
+    with CompiledServerHarness(test_file('sockets/test_sockets_echo_server.c'), args, port) as harness:
+      expected = 'do_msg_read: read 14 bytes'
+      self.do_runf('sockets/test_sockets_echo_client.c', expected, cflags=args + ['-sSOCKET_TRANSPORT=webtransport', '-DSOCKK=%d' % harness.listen_port])
+
+  @requires_dev_dependency('ws')
+  def test_nodejs_sockets_echo_webtransport_runtime_fallback(self):
+    create_file('socket_transport_pre.js', '''
+      var Module = {
+        socket: {
+          transport: 'webtransport',
+        },
+      };
+    ''')
+    with CompiledServerHarness(test_file('sockets/test_sockets_echo_server.c'), ['-DTEST_DGRAM=0'], 59222) as harness:
+      expected = 'do_msg_read: read 14 bytes'
+      self.do_runf('sockets/test_sockets_echo_client.c', expected, cflags=['-DTEST_DGRAM=0', '--pre-js=socket_transport_pre.js', '-DSOCKK=%d' % harness.listen_port])
+
   # Test Emscripten WebSockets API to send and receive text and binary messages against an echo server.
   # N.B. running this test requires 'npm install ws' in Emscripten root directory
   # NOTE: Shared buffer is not allowed for websocket sending.
