@@ -83,6 +83,21 @@ addToLibrary({
       }
       return url;
     },
+    getWebTransportOptions() {
+#if expectToReceiveOnModule('socket')
+      var webtransportConfig = SOCKFS.socketArgs['webtransport'];
+      if (!webtransportConfig || typeof webtransportConfig !== 'object') {
+        return undefined;
+      }
+      var options = {};
+      if (webtransportConfig['serverCertificateHashes']) {
+        options.serverCertificateHashes = webtransportConfig['serverCertificateHashes'];
+      }
+      return Object.keys(options).length ? options : undefined;
+#else
+      return undefined;
+#endif
+    },
     shouldUseWebTransport(sock) {
       return sock.type === {{{ cDefs.SOCK_DGRAM }}} &&
              (sock.transport === 'webtransport' || sock.transport === 'auto');
@@ -500,6 +515,12 @@ addToLibrary({
         }
       },
       close(sock) {
+        if (sock.h3) {
+          try {
+            SOCKFS.webtransport_sock_ops.stopListenServer(sock);
+          } catch (e) {
+          }
+        }
         // if we've spawned a listen server, close it
         if (sock.server) {
           try {
@@ -534,6 +555,16 @@ addToLibrary({
         // binding on a connection-less socket
         // note: this is only required on the server side
         if (sock.type === {{{ cDefs.SOCK_DGRAM }}}) {
+          if (SOCKFS.shouldUseWebTransport(sock)) {
+            // For UDP + WebTransport use a native WebTransport listener in Node.
+            try {
+              SOCKFS.webtransport_sock_ops.listen(sock, 0);
+            } catch (e) {
+              if (!(e.name === 'ErrnoError')) throw e;
+              if (e.errno !== {{{ cDefs.EOPNOTSUPP }}}) throw e;
+            }
+            return;
+          }
           // close the existing server if it exists
           if (sock.server) {
             sock.server.close();
@@ -670,7 +701,7 @@ addToLibrary({
         }
         return { addr, port };
       },
-      sendmsg(sock, buffer, offset, length, addr, port) {
+      sendmsg(sock, buffer, offset, length, addr, port, skipTransportRouting) {
         if (sock.type === {{{ cDefs.SOCK_DGRAM }}}) {
           // connection-less sockets will honor the message address,
           // and otherwise fall back to the bound destination address
@@ -688,7 +719,7 @@ addToLibrary({
           port = sock.dport;
         }
 
-        if (SOCKFS.shouldUseWebTransport(sock)) {
+        if (!skipTransportRouting && SOCKFS.shouldUseWebTransport(sock)) {
           return SOCKFS.webtransport_sock_ops.sendmsg(sock, buffer, offset, length, addr, port);
         }
 
@@ -792,17 +823,213 @@ addToLibrary({
       }
     },
     webtransport_sock_ops: {
+      normalizePeerAddr(addr) {
+        if (addr === null || typeof addr === 'undefined') {
+          return '0.0.0.0';
+        }
+        addr = String(addr);
+        if (addr.startsWith('::ffff:')) {
+          return addr.slice(7);
+        }
+        if (addr === '::1') {
+          return '127.0.0.1';
+        }
+        return addr;
+      },
+      peerKey(addr, port) {
+        return SOCKFS.webtransport_sock_ops.normalizePeerAddr(addr) + ':' + (port | 0);
+      },
+      getServerOptions() {
+        var options = globalThis.__Q3JS_WEBTRANSPORT_SERVER_OPTIONS || {};
+        var moduleOptions = (typeof Module !== 'undefined' && Module) ? Module : {};
+        var cert = options.cert || moduleOptions['cert'];
+        var privKey = options.privKey || moduleOptions['key'] || moduleOptions['privKey'];
+        var secret = options.secret || moduleOptions['secret'] || 'q3js-webtransport-secret';
+        var path = options.path || moduleOptions['path'] || '/';
+        return {
+          cert,
+          privKey,
+          secret,
+          path,
+          fatalListenError: options.fatalListenError !== false
+        };
+      },
+      terminateOnListenFailure(sock, message, options) {
+        if (!ENVIRONMENT_IS_NODE || !options.fatalListenError) {
+          return;
+        }
+#if ENVIRONMENT_MAY_BE_NODE
+        try {
+          SOCKFS.webtransport_sock_ops.stopListenServer(sock);
+        } catch (e) {
+        }
+        err(message);
+        if (typeof process != 'undefined' && typeof process.exit == 'function') {
+          process.exit(1);
+        }
+#endif
+      },
+      startListenServer(sock) {
+        if (!ENVIRONMENT_IS_NODE) {
+          throw new FS.ErrnoError({{{ cDefs.EOPNOTSUPP }}});
+        }
+        if (sock.h3) {
+          return;
+        }
+
+        var Http3ServerConstructor = globalThis.Http3Server;
+        if (!Http3ServerConstructor) {
+          SOCKFS.webtransport_sock_ops.emitError(sock, 'ECONNREFUSED: Http3Server unavailable');
+          throw new FS.ErrnoError({{{ cDefs.EPROTONOSUPPORT }}});
+        }
+
+        var options = SOCKFS.webtransport_sock_ops.getServerOptions();
+        if (!options.cert || !options.privKey) {
+          SOCKFS.webtransport_sock_ops.emitError(sock, 'ECONNREFUSED: WebTransport server requires certificate and key');
+          throw new FS.ErrnoError({{{ cDefs.EINVAL }}});
+        }
+
+        var host = sock.saddr || '0.0.0.0';
+        var port = sock.sport || 0;
+#if SOCKET_DEBUG
+        dbg(`webtransport: listen: ${host}:${port}`);
+#endif
+        sock.h3 = new Http3ServerConstructor({
+          host,
+          port,
+          secret: options.secret,
+          cert: options.cert,
+          privKey: options.privKey
+        });
+
+        sock.h3.ready.then(() => {
+          out(`WebTransport listener ready on https://${host}:${port}${options.path}`);
+          SOCKFS.emit('listen', sock.stream.fd);
+        }).catch((e) => {
+          var message = `ECONNREFUSED: WebTransport listen failed (${e})`;
+          SOCKFS.webtransport_sock_ops.emitError(sock, message);
+          SOCKFS.webtransport_sock_ops.terminateOnListenFailure(sock, message, options);
+        });
+
+        try {
+          sock.h3.startServer();
+          sock.h3SessionReader = sock.h3.sessionStream(options.path).getReader();
+        } catch (e) {
+          var message = `ECONNREFUSED: WebTransport listen setup failed (${e})`;
+          SOCKFS.webtransport_sock_ops.emitError(sock, message);
+          SOCKFS.webtransport_sock_ops.terminateOnListenFailure(sock, message, options);
+          throw new FS.ErrnoError({{{ cDefs.ECONNREFUSED }}});
+        }
+        SOCKFS.webtransport_sock_ops.readIncomingSessions(sock, sock.h3SessionReader);
+      },
+      stopListenServer(sock) {
+        try {
+          sock.h3SessionReader?.cancel();
+        } catch (e) {
+        }
+        sock.h3SessionReader = null;
+        try {
+          sock.h3?.stopServer();
+        } catch (e) {
+        }
+        sock.h3 = null;
+      },
+      readIncomingSessions(sock, sessionReader) {
+        sessionReader.read().then((result) => {
+          if (result.done) {
+            return;
+          }
+          SOCKFS.webtransport_sock_ops.acceptSession(sock, result.value);
+          SOCKFS.webtransport_sock_ops.readIncomingSessions(sock, sessionReader);
+        }).catch((e) => {
+          SOCKFS.webtransport_sock_ops.emitError(sock, `ECONNREFUSED: WebTransport accept failed (${e})`);
+        });
+      },
+      acceptSession(sock, session) {
+        var remote = session?.cobj?.intSession?.jsobj || {};
+        var addr = SOCKFS.webtransport_sock_ops.normalizePeerAddr(
+          remote.remoteAddress || remote.address || '0.0.0.0'
+        );
+        var port = (remote.remotePort || remote.port || 0) | 0;
+        // Some implementations do not expose remotePort; synthesize a stable
+        // port per accepted session to keep sockaddr mapping deterministic.
+        if (!port) {
+          if (!sock.nextPeerPort || sock.nextPeerPort > 65000) {
+            sock.nextPeerPort = 40000;
+          }
+          port = sock.nextPeerPort++;
+        }
+        var peer = {
+          addr,
+          port,
+          transport: session,
+          msg_send_queue: [],
+          ready: false,
+          closed: false,
+          writer: null,
+          reader: null
+        };
+        SOCKFS.webtransport_sock_ops.addPeer(sock, peer);
+        SOCKFS.webtransport_sock_ops.handlePeerEvents(sock, peer);
+        SOCKFS.emit('connection', sock.stream.fd);
+      },
       getPeer(sock, addr, port) {
-        return sock.peers[addr + ':' + port];
+        var key = SOCKFS.webtransport_sock_ops.peerKey(addr, port);
+        var peer = sock.peers[key];
+        if (peer) {
+          return peer;
+        }
+        addr = String(addr || '');
+        if (addr.startsWith('::ffff:')) {
+          return sock.peers[(addr.slice(7)) + ':' + (port | 0)];
+        }
+        if (addr && addr.indexOf(':') === -1) {
+          return sock.peers['::ffff:' + addr + ':' + (port | 0)];
+        }
+        return null;
       },
       addPeer(sock, peer) {
-        sock.peers[peer.addr + ':' + peer.port] = peer;
+        peer.addr = SOCKFS.webtransport_sock_ops.normalizePeerAddr(peer.addr);
+        peer.port = (peer.port | 0);
+        var keys = [];
+        var addKey = (key) => {
+          if (!sock.peers[key]) {
+            sock.peers[key] = peer;
+          }
+          if (!keys.includes(key)) {
+            keys.push(key);
+          }
+        };
+        addKey(SOCKFS.webtransport_sock_ops.peerKey(peer.addr, peer.port));
+        if (peer.addr.indexOf(':') === -1) {
+          addKey('::ffff:' + peer.addr + ':' + peer.port);
+        } else if (peer.addr.startsWith('::ffff:')) {
+          addKey(peer.addr.slice(7) + ':' + peer.port);
+        }
+        if (peer.addr === '127.0.0.1') {
+          addKey('::1:' + peer.port);
+        } else if (peer.addr === '::1') {
+          addKey('127.0.0.1:' + peer.port);
+        }
+        peer._peerKeys = keys;
       },
       removePeer(sock, peer) {
-        delete sock.peers[peer.addr + ':' + peer.port];
+        if (peer?._peerKeys?.length) {
+          for (var key of peer._peerKeys) {
+            if (sock.peers[key] === peer) {
+              delete sock.peers[key];
+            }
+          }
+          peer._peerKeys = [];
+          return;
+        }
+        delete sock.peers[SOCKFS.webtransport_sock_ops.peerKey(peer.addr, peer.port)];
       },
       emitError(sock, message) {
         sock.error = {{{ cDefs.ECONNREFUSED }}};
+        if (ENVIRONMENT_IS_NODE) {
+          err(message);
+        }
         SOCKFS.emit('error', [sock.stream.fd, sock.error, message]);
       },
       closePeer(sock, peer) {
@@ -828,6 +1055,11 @@ addToLibrary({
 #if SOCKET_DEBUG
         dbg(`webtransport: fallback to websocket (${reason})`);
 #endif
+        // In strict WebTransport mode, do not silently downgrade to WebSocket.
+        if (sock.transport !== 'auto') {
+          SOCKFS.webtransport_sock_ops.emitError(sock, `ECONNREFUSED: WebTransport required (${reason})`);
+          throw new FS.ErrnoError({{{ cDefs.EPROTONOSUPPORT }}});
+        }
         sock.error = {{{ cDefs.EPROTONOSUPPORT }}};
         sock.transport = 'websocket';
         return SOCKFS.websocket_sock_ops.createPeer(sock, addr, port);
@@ -851,11 +1083,12 @@ addToLibrary({
 
         var session;
         var url = SOCKFS.getWebTransportURL(addr, port);
+        var options = SOCKFS.getWebTransportOptions();
 #if SOCKET_DEBUG
         dbg(`webtransport: connect: ${url}`);
 #endif
         try {
-          session = new WebTransportConstructor(url);
+          session = options ? new WebTransportConstructor(url, options) : new WebTransportConstructor(url);
         } catch (e) {
           return SOCKFS.webtransport_sock_ops.fallbackToWebSocket(sock, addr, port, `WebTransport constructor failed: ${e}`);
         }
@@ -894,6 +1127,9 @@ addToLibrary({
         sock.daddr = peer.addr;
         sock.dport = peer.port;
         sock.connecting = true;
+      },
+      listen(sock, backlog) {
+        SOCKFS.webtransport_sock_ops.startListenServer(sock);
       },
       flushSendQueue(sock, peer) {
         var queued = peer.msg_send_queue.shift();
@@ -934,13 +1170,19 @@ addToLibrary({
             return;
           }
           try {
-            peer.writer = peer.transport.datagrams.writable.getWriter();
-            peer.reader = peer.transport.datagrams.readable.getReader();
+            var datagrams = peer.transport.datagrams;
+            if (datagrams?.createWritable) {
+              peer.writer = datagrams.createWritable().getWriter();
+            } else {
+              peer.writer = datagrams.writable.getWriter();
+            }
+            peer.reader = datagrams.readable.getReader();
           } catch (e) {
             try {
               SOCKFS.webtransport_sock_ops.fallbackPeerToWebSocket(sock, peer, `Datagram setup failed: ${e}`);
             } catch (fallbackError) {
-              SOCKFS.webtransport_sock_ops.emitError(sock, `ECONNREFUSED: WebTransport fallback failed (${fallbackError})`);
+              var msg = fallbackError?.message || String(fallbackError);
+              SOCKFS.webtransport_sock_ops.emitError(sock, `ECONNREFUSED: WebTransport fallback failed (${msg})`);
             }
             return;
           }
@@ -953,7 +1195,8 @@ addToLibrary({
           try {
             SOCKFS.webtransport_sock_ops.fallbackPeerToWebSocket(sock, peer, `Session ready failed: ${e}`);
           } catch (fallbackError) {
-            SOCKFS.webtransport_sock_ops.emitError(sock, `ECONNREFUSED: WebTransport fallback failed (${fallbackError})`);
+            var msg = fallbackError?.message || String(fallbackError);
+            SOCKFS.webtransport_sock_ops.emitError(sock, `ECONNREFUSED: WebTransport fallback failed (${msg})`);
           }
         });
 
@@ -979,11 +1222,20 @@ addToLibrary({
 
         var dest = SOCKFS.webtransport_sock_ops.getPeer(sock, addr, port);
         if (!dest || dest.closed) {
+          if (sock.h3) {
+            SOCKFS.webtransport_sock_ops.emitError(
+              sock,
+              `EHOSTUNREACH: no WebTransport peer for ${SOCKFS.webtransport_sock_ops.normalizePeerAddr(addr)}:${port | 0}`
+            );
+            throw new FS.ErrnoError({{{ cDefs.EHOSTUNREACH }}});
+          }
           dest = SOCKFS.webtransport_sock_ops.createPeer(sock, addr, port);
         }
 
         if (dest.socket) {
-          return SOCKFS.websocket_sock_ops.sendmsg(sock, buffer, offset, length, addr, port);
+          // Route through websocket send without transport re-dispatching to avoid
+          // recursion for peers created by websocket listen paths.
+          return SOCKFS.websocket_sock_ops.sendmsg(sock, buffer, offset, length, addr, port, true);
         }
 
         var data = SOCKFS.sliceSendData(buffer, offset, length);
